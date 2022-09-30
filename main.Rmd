@@ -1,0 +1,897 @@
+---
+title: "Paper3"
+author: "Camille Crapart"
+date: '2022-09-02'
+output: html_document
+
+bibliography: C:\\Users\\raine\\Documents\\UiO\\Bibtex\\Paper3.bib
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache = F, collapse = T,  message = F, warning = F, error = F)
+```
+
+```{r libraries}
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(dlookr)
+
+library(sf)
+library(raster)
+library(spatialreg)
+library(spdep)
+
+library(MASS)
+
+library(mgcv)
+library(car)
+
+library(factoextra)
+library(kableExtra)
+
+library(corrplot)
+library(cowplot)
+
+memory.limit(size = 1e+10)
+
+id.names <- c("station_id","station_code","nve_vatn_nr","nve_vassdrag_nr", "CBA_Lake_ID", "STATION_ID", "statn_d","longitude","latitude", "region", "region2")
+is_constant <- function(x) length(unique(x)) == 1L 
+```
+# Intro
+
+Aim of the study: 
+
+* investigate links between biodegredability and catchment characteristics
+* validate the biodegradability experiment on a larger scale?
+
+Reminder: biodegradability indicators are derived from the incubation experiment conducted in 2019, with the 1000-lakes-survey samples (500 samples analysed). The experiment consists in incubating filtrated samples with addition of nutrients during 30h at 25°C.
+
+* RR (respiration rate) is the maximum oxygen consumption rate during the incubation, in uM/h
+* Bdgt (biodegration period) is the time during which oxygen consumption occurs (during exponential bacterial growth) (in h)
+
+
+# Data preparation 
+
+## Import data from NIVA
+
+```{r load-data-niva, eval = F}
+id.niva <- read_xlsx("id_niva.xlsx")
+
+catchment.poly <- st_read("catchments_poly/lakes1000cat.shp")
+niva.stations <- st_read("catchments_poly/lakes1000stations.shp")
+niva.data <- read_xlsx("niva_selection.xlsx", sheet = "niva")
+
+all.niva <- st_drop_geometry(niva.stations) %>% merge(niva.data, by.x = "sttn_cd", by.y = "station_code") %>% merge(catchment.poly, by.x = "statn_d", by.y= "station_id")
+
+#bdg.stations <- id.niva %>% merge(niva.stations, by.x = "STATION_ID", by.y = "sttn_cd") %>% merge(niva.data, by.x = "STATION_ID", by.y = "station_code")
+bdg.niva <- id.niva %>% merge(all.niva, by.x = "STATION_ID", by.y = "sttn_cd") %>% st_as_sf()
+
+missing.bdg <- id.niva %>% filter(!STATION_ID %in% bdg.niva$STATION_ID)
+
+saveRDS(bdg.niva, "bdg.niva.rds")
+```
+
+The lake sampled by NIVA are spread into 10 different regions, that do not correspond to the Norwegian fylke: 
+
+* Region 1: Hedmark, Oppland
+* Region 2: Telemark, Buskerud, Vestfold, Østfold, Akershus, Hedmark, Oppland
+* Region 3: Telemark, Oppland, Buskerud, Sogn of Fjordane, Hordaland
+* Region 4: Aust-Agder, Telemark, Vest-Agder
+* Region 5: Rogaland, Vest-Agder, Hordaland
+* Region 6: Hordaland, Rogaland, Sogn og Fjordane   
+* Region 7: Hordaland, Sogn og Fjordane
+* Region 8 : Sør-Trøndelag, Møre og Romsdal, Nord-Trondelag
+* Region 9 : Troms, Nordland, Finmark
+* Region 10: Finmark
+
+
+The 10 regions are groupes in eco-regions. ref: @Garmo2021, appendix 1
+
+" 2.6  Eco-regions
+The ThousandLakes and TrendLakes are positioned along strong climatic, ecosystem and environmental gradients with regional contrasts in intensity of environmental pressures. Ten ecoregions have been defined that include a gradient of deposition, climate, and biogeographical conditions (Dillon et al., 2003) (Table 1), which were reduced to six in the current paper, as shown in Figure 1, i.e., South (region 4+5), East (1+2), Inland (3), West (region 6+7), Central (region 8) and North (region 9+10). The regional contrasts in lake chemistry (Figure 2, Table 2, Figure SI 2) can be partially explained by variations in air pollution, acid sensitivity, proximity to the coast, elevation, vegetation and soil characteristics (Henriksen et al., 1998). South Norway has historically received the highest loadings of atmospheric pollution, followed by east and inland Norway while central and northern Norway were much less exposed being further away from the sources (Figure 1, Table 1). The most acid-sensitive areas are also located in southern Norway (Austnes et al., 2018) and thus, the highest concentration levels of acidification-related parameters such as labile Al and SO4 and the lowest pH, alkalinity and ANC are found here. However, sources of SO4 other than air pollution such as sea-salt, marine sediments (Maxe, 2001), and geological sources also contribute to elevated concentrations of SO4, especially in Northern Norway (Wilander, 1994). Similarly, the regional contrasts in Cl-levels can be related to presence of marine clays and sea-salt aerosols, explaining why especially lakes in inland Norway, located above the marine limit, are low in Cl. Sea-salt-corrected SO4,  indicates very similar relative change compared with uncorrected SO4 (Table 2, Table SI 4)."
+
+```{r plot-niva-catchments}
+bdg.niva <- readRDS("bdg.niva.rds")
+
+ggplot(bdg.niva)+geom_sf(aes(fill = as.factor(region2), col = as.factor(region2)))+
+  scale_color_brewer(palette = "Spectral", aesthetics = c("col","fill"), name = "Region" )+
+  theme_minimal(base_size = 24)
+
+ggplot(bdg.niva)+geom_point(aes(x = longitude, y = latitude, col = as.factor(region2)))+
+  scale_color_brewer(palette = "Spectral", aesthetics = c("col","fill"), name = "Region")+
+  theme_minimal(base_size = 24)
+
+```
+
+## Extract NDVI 2019 
+
+```{r extract-ndvi, eval = F}
+copernicus.files <- list.files(path = "Summer_NDVI_2019", pattern = "1.nc", full.names = T)
+
+copernicus.stack <- raster::stack(copernicus.files, varname = "NDVI")
+copernicus.fennoscandia <- raster::crop(copernicus.stack, c(0,35,55,73))
+copernicus.mean <- copernicus.fennoscandia %>% stackApply(indices = c(1:length(copernicus.files)), fun = mean, na.rm = T)
+
+copernicus.fen <- copernicus.fennoscandia %>% mean()
+
+niva.ndvi <- raster::extract(copernicus.fen, catchments.bdg, sp = T, fun = mean, df = T, na.rm = T)
+names(niva.ndvi) <- c("station_id", "ndvi")
+saveRDS(niva.ndvi, "Summer_NDVI_2019/niva.ndvi.rds")
+```
+
+
+## Soil
+
+Soil thickness: extracted from ORNL DAAC: https://daac.ornl.gov/SOILS/guides/Global_Soil_Regolith_Sediment.html 
+
+Chose the average value: "average_soil_and_sedimentary-deposit_thickness.tif"
+-> A grid that averages soil and sedimentary deposit thicknesses in meters for users who want a single thickness value that averages across upland hillslope and valley bottoms.
+
+```{r extract-soil-depth, eval = F}
+soil <- raster::raster("DAAC/average_soil_and_sedimentary-deposit_thickness.tif")
+catchment.poly <- st_read("catchments_poly/lakes1000cat.shp")
+soil.df <- extract(soil, catchment.poly, sp = T, df = T, na.rm = T, fun = mean)
+names(soil.df) <- c("station_id","soil")
+saveRDS(soil.df, "soil.df.rds")
+```
+
+## Create dataset
+
+```{r create-dataset, eval = F}
+niva.ndvi <- readRDS("Summer_NDVI_2019/niva.ndvi.rds")
+bdg.niva <- readRDS("bdg.niva.rds")
+soil <- readRDS("soil.df.rds")
+nor <- st_read("Country_shapefile/norway.shp") %>% st_transform(st_crs(bdg.niva))
+  
+rr <- read_xlsx("RR1000s.xlsx")
+rr$...1 <- NULL
+
+keep <- c("ph_2019","tg_6m_19","kond_2019","toc_2019","cndom_corr_2019", "era_prec_2019", "rr_2m_19","mean_elev","nilu_ndep_2012_2016","nilu_sdep_2012_2016","freshwater","forest","agriculture","peat","basin_area_km2", "tn_2019","tp_2019", "fe_2019")
+
+bdg.data <- bdg.niva[,which(names(bdg.niva) %in% c(id.names,keep))] %>% merge(dplyr::select(rr,c("Sample_ID","dmax","hwidth")), by.x = "CBA_Lake_ID", by.y = "Sample_ID") %>%  merge(niva.ndvi, by.x = "statn_d", by.y = "station_id") %>% merge(soil, by.x = "statn_d", by.y = "station_id")
+
+bdg.data$rrn <- bdg.data$dmax/bdg.data$toc_2019
+
+names(bdg.data) <- c("statn_d","CBA_Lake_ID","STATION_ID","station_id","latitude","longitude","nve_vatn_nr", "nve_vassdrag_nr","region","basin_area_km2","mean_elev","agriculture","forest","peat","freshwater","precip", "ndep","sdep","runoff","temp","cond","toc","cndom","ph","tn","tp","fe","region2","rr","bdgt","ndvi","soil","geometry","rrn") 
+
+saveRDS(bdg.data,"bdg.data.rds")
+```
+# Comparison 73 lakes / 500 lakes
+
+```{r read-rr-data, fig.dim = c(18,6)}
+rr100 <- read_xlsx("waterchem.xlsx") %>% dplyr::select(c("Sample_ID", "Vmax", "BdgT","TOC")) %>% setNames(c("Sample_ID","rr_100","bdgt_100","TOC_100"))
+rr1000 <- readRDS("bdg.data.rds") %>% dplyr::select(c("CBA_Lake_ID", "rr", "bdgt","toc")) %>% setNames(c("Sample_ID","rr_1000","bdgt_1000", "TOC_1000"))
+
+rr.all <- merge(rr100, rr1000, by = "Sample_ID")
+
+rr.all$log.rr_100 <- log(rr.all$rr_100)
+rr.all$log.rr_1000 <- log(rr.all$rr_1000)
+rr.all$log.bdgt_100 <- log(rr.all$bdgt_100)
+rr.all$log.bdgt_1000 <- log(rr.all$bdgt_1000)
+
+p1 <- ggplot(data = rr.all) + geom_point(aes(x=rr_100, y = rr_1000))+
+  labs(x="RR - NIVA 100 lakes", y = "RR - NIVA 1000 lakes")+
+  theme_minimal(base_size = 25)
+p2 <- ggplot(data = rr.all) + geom_point(aes(x=bdgt_100, y = bdgt_1000)) + 
+  labs(x="BdgT - NIVA 100 lakes", y = "BdgT - NIVA 1000 lakes") +
+    theme_minimal(base_size = 25)
+p3 <- ggplot(data = rr.all) + geom_point(aes(x=TOC_100, y = TOC_1000)) + 
+  labs(x="TOC - NIVA 100 lakes", y = "TOC - NIVA 1000 lakes") +
+    theme_minimal(base_size = 25)
+
+plot_grid(plotlist = list(p1,p2,p3), nrow = 1, ncol = 3)
+
+```
+
+```{r compare-log, fig.dim = c(18,6)}
+
+p4 <- ggplot(data = rr.all) + geom_point(aes(x=log.rr_100, y = log.rr_1000, col = TOC_100)) + 
+  labs(x="log RR - NIVA 100 lakes", y = "log RR - NIVA 1000 lakes") +
+    theme_minimal(base_size = 25)
+
+p5 <- ggplot(data = rr.all) + geom_point(aes(x=log.bdgt_100, y = log.bdgt_1000, col = TOC_100)) + 
+  labs(x="log BdgT - NIVA 100 lakes", y = "log BdgT - NIVA 1000 lakes") +
+    theme_minimal(base_size = 25)
+
+plot_grid(plotlist = list(p4,p5), nrow = 1, ncol = 2)
+
+```
+
+## SCM
+
+from http://www.dagitty.net/dags.html#
+
+```{r DAG-plot}
+testImplications <- function( covariance.matrix, sample.size ){
+	library(ggm)
+	tst <- function(i){ pcor.test( pcor(i,covariance.matrix), length(i)-2, sample.size )$pvalue }
+tos <- function(i){ paste(i,collapse=" ") }
+implications <- list(c("forest","agriculture"),
+		c("forest","peat"),
+		c("forest","log.ndep"),
+		c("forest","log.runoff"),
+		c("forest","log.cond","log.tp","log.tn"),
+		c("forest","log.cond","log.toc"),
+		c("forest","log.cond","ndvi"),
+		c("forest","log.cndom","log.toc"),
+		c("forest","log.cndom","ndvi"),
+		c("forest","pH","log.toc"),
+		c("forest","pH","ndvi"),
+		c("forest","log.fe"),
+		c("forest","log.soil"),
+		c("forest","log.toc","ndvi"),
+		c("forest","log.tn","log.toc"),
+		c("forest","log.tn","ndvi"),
+		c("forest","log.tp","log.toc"),
+		c("forest","log.tp","ndvi"),
+		c("forest","log.rr","log.cndom"),
+		c("forest","log.rr","log.toc"),
+		c("forest","log.rr","ndvi"),
+		c("forest","log.bdgt","log.cond"),
+		c("forest","log.bdgt","log.tp","log.tn"),
+		c("forest","log.bdgt","log.toc"),
+		c("forest","log.bdgt","ndvi"),
+		c("agriculture","peat"),
+		c("agriculture","log.ndep"),
+		c("agriculture","log.runoff"),
+		c("agriculture","log.cond","log.tp","log.tn"),
+		c("agriculture","log.cond","log.toc","log.tp"),
+		c("agriculture","log.cndom"),
+		c("agriculture","pH"),
+		c("agriculture","log.fe"),
+		c("agriculture","ndvi"),
+		c("agriculture","log.soil"),
+		c("agriculture","log.toc"),
+		c("agriculture","log.tn"),
+		c("agriculture","log.rr"),
+		c("agriculture","log.bdgt","log.cond"),
+		c("agriculture","log.bdgt","log.tp","log.tn"),
+		c("agriculture","log.bdgt","log.toc","log.tp"),
+		c("peat","log.ndep"),
+		c("peat","log.runoff"),
+		c("peat","log.cond","log.tp","log.tn"),
+		c("peat","log.cond","log.toc"),
+		c("peat","log.cndom","log.toc"),
+		c("peat","pH","log.toc"),
+		c("peat","log.fe"),
+		c("peat","ndvi"),
+		c("peat","log.soil"),
+		c("peat","log.tn","log.toc"),
+		c("peat","log.tp","log.toc"),
+		c("peat","log.rr","log.cndom"),
+		c("peat","log.rr","log.toc"),
+		c("peat","log.bdgt","log.cond"),
+		c("peat","log.bdgt","log.tp","log.tn"),
+		c("peat","log.bdgt","log.toc"),
+		c("log.ndep","log.runoff"),
+		c("log.ndep","log.cond","log.tp","log.tn"),
+		c("log.ndep","log.cond","log.toc","log.tn"),
+		c("log.ndep","log.cndom"),
+		c("log.ndep","log.fe"),
+		c("log.ndep","ndvi"),
+		c("log.ndep","log.soil"),
+		c("log.ndep","log.toc"),
+		c("log.ndep","log.tp"),
+		c("log.ndep","log.rr"),
+		c("log.ndep","log.bdgt","log.cond"),
+		c("log.ndep","log.bdgt","log.tp","log.tn"),
+		c("log.ndep","log.bdgt","log.toc","log.tn"),
+		c("log.runoff","log.cond"),
+		c("log.runoff","log.cndom"),
+		c("log.runoff","pH"),
+		c("log.runoff","log.fe"),
+		c("log.runoff","ndvi"),
+		c("log.runoff","log.toc"),
+		c("log.runoff","log.tn"),
+		c("log.runoff","log.tp"),
+		c("log.runoff","log.rr"),
+		c("log.runoff","log.bdgt"),
+		c("log.cond","log.cndom","log.toc"),
+		c("log.cond","log.cndom","log.tp","log.tn"),
+		c("log.cond","pH","log.ndep","log.toc"),
+		c("log.cond","pH","log.toc","log.tn"),
+		c("log.cond","pH","log.tp","log.tn"),
+		c("log.cond","log.fe"),
+		c("log.cond","ndvi","log.toc"),
+		c("log.cond","ndvi","log.tp","log.tn"),
+		c("log.cond","log.soil"),
+		c("log.cond","log.toc","log.tp","log.tn"),
+		c("log.cond","log.rr","log.cndom"),
+		c("log.cond","log.rr","log.toc"),
+		c("log.cond","log.rr","log.tp","log.tn"),
+		c("log.cndom","pH","log.toc"),
+		c("log.cndom","ndvi","log.toc"),
+		c("log.cndom","log.soil"),
+		c("log.cndom","log.tn","log.toc"),
+		c("log.cndom","log.tp","log.toc"),
+		c("log.cndom","log.bdgt","log.cond"),
+		c("log.cndom","log.bdgt","log.tp","log.tn"),
+		c("log.cndom","log.bdgt","log.toc"),
+		c("pH","log.fe"),
+		c("pH","ndvi","log.toc"),
+		c("pH","log.soil"),
+		c("pH","log.tn","log.toc","log.ndep"),
+		c("pH","log.tp","log.toc"),
+		c("pH","log.rr","log.cndom"),
+		c("pH","log.rr","log.toc"),
+		c("pH","log.bdgt","log.cond"),
+		c("pH","log.bdgt","log.tp","log.tn"),
+		c("pH","log.bdgt","log.toc","log.tn"),
+		c("pH","log.bdgt","log.toc","log.ndep"),
+		c("log.fe","ndvi"),
+		c("log.fe","log.soil"),
+		c("log.fe","log.toc"),
+		c("log.fe","log.tn"),
+		c("log.fe","log.tp"),
+		c("log.fe","log.rr","log.cndom"),
+		c("log.fe","log.bdgt"),
+		c("ndvi","log.soil"),
+		c("ndvi","log.tn","log.toc"),
+		c("ndvi","log.tp","log.toc"),
+		c("ndvi","log.rr","log.cndom"),
+		c("ndvi","log.rr","log.toc"),
+		c("ndvi","log.bdgt","log.cond"),
+		c("ndvi","log.bdgt","log.tp","log.tn"),
+		c("ndvi","log.bdgt","log.toc"),
+		c("log.soil","log.toc"),
+		c("log.soil","log.tn"),
+		c("log.soil","log.tp"),
+		c("log.soil","log.rr"),
+		c("log.soil","log.bdgt"),
+		c("log.toc","log.rr","log.cndom"),
+		c("log.toc","log.bdgt","log.cond"),
+		c("log.toc","log.bdgt","log.tp","log.tn"),
+		c("log.tn","log.tp","log.toc"),
+		c("log.tn","log.rr","log.cndom"),
+		c("log.tn","log.rr","log.toc"),
+		c("log.tn","log.bdgt","log.cond"),
+		c("log.tp","log.rr","log.cndom"),
+		c("log.tp","log.rr","log.toc"),
+		c("log.tp","log.bdgt","log.cond"),
+		c("log.rr","log.bdgt","log.cond"),
+		c("log.rr","log.bdgt","log.tp","log.tn"),
+		c("log.rr","log.bdgt","log.toc"),
+		c("log.rr","log.bdgt","log.cndom"))
+	data.frame( implication=unlist(lapply(implications,tos)),
+		pvalue=unlist( lapply( implications, tst ) ) )
+
+}
+```
+
+## Transform dataset
+
+Detection and log of skewed data. 
+
+```{r skewness, eval = F}
+bdg.data <- readRDS("bdg.data.rds")
+
+bdg.df <- bdg.data[,- which(names(bdg.data) %in% id.names[-which(id.names %in% c("CBA_Lake_ID","longitude","latitude","region","region2"))])] %>% st_drop_geometry()
+
+skewed.data <- find_skewness(bdg.df, index = F)
+
+bdg.trans <- bdg.df
+for(i in skewed.data){
+  newname <- paste("log",i, sep = ".")
+  oldnames <- names(bdg.trans)
+  bdg.trans <<- cbind(bdg.trans, log(bdg.trans[[i]])) %>% setNames(c(oldnames,newname))
+}
+
+# bdg.trans <- bdg.data %>% mutate_at(.funs = transform, method = "log", .vars = skewed.data) %>% st_drop_geometry()
+# sapply(bdg.trans,"class")
+# bdg.trans[,which(names(bdg.trans) %in% skewed.data)] <- as.numeric(bdg.trans[,which(names(bdg.trans) %in% skewed.data)])
+# 
+# skewed.index <- which(names(bdg.trans) %in% skewed.data)
+# names(bdg.trans)[skewed.index] <- paste("log",skewed.data,sep = ".")
+
+find_na(bdg.trans, index = F)
+bdg.trans <- bdg.trans %>%  filter(is.na(log.ndep) == F) %>% filter(is.na(log.cndom)==F) %>% filter(log.soil != -Inf) %>% filter(log.bdgt != -Inf)
+
+bdg.trans$log.agriculture <- NULL
+bdg.trans$log.forest <- NULL
+bdg.trans$log.peat <- NULL
+bdg.trans$log.ndvi <- NULL
+
+saveRDS(bdg.trans,"bdg.trans.rds")
+```
+
+```{r select-variables, eval = T}
+bdg.trans <- readRDS("bdg.trans.rds")
+
+vars <- c("region2", "agriculture","forest","peat","log.ndep","log.runoff","log.cond","log.cndom","ph","log.fe","ndvi","log.soil","log.toc","log.tn","log.tp","log.rr","log.bdgt","log.rrn")
+
+bdg.sel <- bdg.trans[vars]
+saveRDS(bdg.sel, "bdg.sel.rds")
+
+```
+
+## Explore dataset
+
+## PCA
+
+```{r pca-total, fig.dim = c(10,8)}
+
+library(viridisLite)
+
+pca.rr <- prcomp(formula = ~., data = bdg.sel[,-which(names(bdg.sel) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+plot.pca.12 <- fviz_pca_biplot(pca.rr,
+                              habillage = "none",
+                             col.ind = bdg.sel$region2, 
+                             label = "var",
+                             col.var = "black",
+                             labelsize = 7,
+                             repel = T,arrowsize=1)+theme_bw(base_size=30)
+
+plot.pca.23 <- fviz_pca_biplot(pca.rr, axes = c(2,3),
+                              habillage = "none",
+                             col.ind = bdg.sel$region2, 
+                             label = "var",
+                             labelsize = 7,
+                             col.var = "black",
+                             repel = T,arrowsize=1)+theme_bw(base_size=30)
+par(mfrows = c(1,2))
+plot.pca.12
+plot.pca.23
+
+``` 
+
+### Scatterplot TOC
+
+```{r difference-groups-toc, fig.dim = c(18,4)}
+ggplot(bdg.sel, aes(x=log.toc, y = log.bdgt, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size= 25)+theme(legend.position = "none")
+
+ggplot(bdg.sel, aes(x=log.toc, y = log.rr, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size = 25)+theme(legend.position = "none")
+```
+
+### Scatterplot Runoff
+
+```{r difference-groups-runoff, fig.dim = c(18,4)}
+ggplot(bdg.sel, aes(x=log.runoff, y = log.bdgt, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size= 25)+theme(legend.position = "none")
+
+ggplot(bdg.sel, aes(x=log.runoff, y = log.rr, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size = 25)+theme(legend.position = "none")
+```
+
+### Scatterplot Conductivity 
+
+```{r difference-groups-cond, fig.dim = c(18,4)}
+ggplot(bdg.sel, aes(x=log.cond, y = log.bdgt, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size= 25)+theme(legend.position = "none")
+
+ggplot(bdg.sel, aes(x=log.cond, y = log.rr, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size = 25)+theme(legend.position = "none")
+```
+
+### Scatterplot NDVI
+
+```{r difference-groups-ndvi, fig.dim = c(18,4)}
+ggplot(bdg.sel, aes(x=ndvi, y = log.bdgt, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size= 25)+theme(legend.position = "none")
+
+ggplot(bdg.sel, aes(x=ndvi, y = log.rr, col = region2))+geom_point()+geom_smooth(method = "lm")+
+  facet_grid(cols = vars(region2))+theme_minimal(base_size = 25)+theme(legend.position = "none")
+```
+
+## Corrplot for all lakes
+
+```{r corrplot, eval= T}
+bdg.sel <- readRDS("bdg.sel.rds")
+
+cor.mat <- cor(bdg.sel[,-1])
+p.mat <- corrplot::cor.mtest(bdg.sel[,-1],conf.level=0.95)
+corrplot::corrplot(cor.mat,type=c("lower"), method = "color", addCoef.col = "grey", p.mat = p.mat$p,insig = "blank", diag = F)
+```
+
+package
+nlmi
+lmi
+glmmtmb
+
+
+## SELM
+
+```{r selm-total}
+
+bdg.spdf <- SpatialPointsDataFrame(bdg.trans[,c("longitude","latitude")], bdg.sel)
+bdg.kmat <- knearneigh(bdg.spdf, k = 50) %>% knn2nb() %>% nb2listw()
+
+rr.selm <- errorsarlm(formula= log.rr~log.cndom+log.ndep+log.tp, bdg.sel, bdg.kmat)
+qplot(rr.selm$fitted.values, bdg.sel$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red") +
+  labs(y="log.rr for Norway", x = "Predicted values for log.rr") + theme_minimal(base_size = 25)
+
+bdgt.selm <- errorsarlm(formula= log.bdgt~forest + log.runoff, bdg.sel, bdg.kmat)
+qplot(bdgt.selm$fitted.values, bdg.sel$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red") +
+  labs(y="log.bdgt for Norway", x = "Predicted values for log.bdgt") + theme_minimal(base_size = 25)
+```
+
+# Analysis by region
+
+```{r dataframes-regions}
+bdg.trans <- readRDS("bdg.trans.rds")
+bdg.sel <- readRDS("bdg.sel.rds")
+
+b1 <- bdg.sel %>% filter(region2 == "1-South") %>% subset(select = -1)
+b1.spdf <- SpatialPointsDataFrame(filter(bdg.trans, region2 == "1-South")[,c("longitude","latitude")], b1) 
+b1.kmat <- knearneigh(b1.spdf, k = 10) %>% knn2nb() %>% nb2listw()
+
+b2 <- bdg.sel %>% filter(region2 == "2-East") %>% subset(select = -1) 
+b2.spdf <- SpatialPointsDataFrame(filter(bdg.trans, region2 == "2-East")[,c("longitude","latitude")], b2) 
+b2.kmat <- knearneigh(b2.spdf, k = 10) %>% knn2nb() %>% nb2listw()
+
+b3 <- bdg.sel %>% filter(region2 == "3-Mountains") %>% subset(select = -1)
+b3.spdf <- SpatialPointsDataFrame(filter(bdg.trans, region2 == "3-Mountains")[,c("longitude","latitude")], b3) 
+b3.kmat <- knearneigh(b3.spdf, k = 10) %>% knn2nb() %>% nb2listw()
+
+b4 <- bdg.sel %>% filter(region2 == "4-West") %>% subset(select = -1)
+b4.spdf <- SpatialPointsDataFrame(filter(bdg.trans, region2 == "4-West")[,c("longitude","latitude")], b4) 
+b4.kmat <- knearneigh(b4.spdf, k = 10) %>% knn2nb() %>% nb2listw()
+
+b5 <- bdg.sel %>% filter(region2 == "5-Central") %>% subset(select = -1)
+b5.spdf <- SpatialPointsDataFrame(filter(bdg.trans, region2 == "5-Central")[,c("longitude","latitude")], b5) 
+b5.kmat <- knearneigh(b5.spdf, k = 10) %>% knn2nb() %>% nb2listw()
+
+b6 <- bdg.sel %>% filter(region2 == "6-North") %>% subset(select = -1)
+b6.spdf <- SpatialPointsDataFrame(filter(bdg.trans, region2 == "6-North")[,c("longitude","latitude")], b6) 
+b6.kmat <- knearneigh(b6.spdf, k = 10) %>% knn2nb() %>% nb2listw()
+```
+
+## ANOVA
+
+```{r boxplot-by-region, fig.dim = c(10,5)}
+
+#ggplot(bdg.trans,aes(x = region2, y=log.rrn))+geom_boxplot(outlier.shape = NA, notch = T)+
+#  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.rrn", col = "Region")+
+#  theme_minimal(base_size = 25)
+
+ggplot(bdg.trans,aes(x = region2, y=log.rr))+geom_boxplot(outlier.shape = NA, notch = T)+
+  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.rr", col = "Region")+
+  theme_minimal(base_size = 25)
+
+ggplot(bdg.trans,aes(x = region2, y=log.bdgt))+geom_boxplot(outlier.shape = NA, notch = T)+
+  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.bdgt", col = "Region")+
+  theme_minimal(base_size = 25)
+```
+```{r anova}
+
+rr.aov <- aov(log.rr~region2, data = bdg.sel) 
+
+summary(rr.aov)[[1]] %>% as.data.frame() %>% knitr::kable(caption = "ANOVA log.rr") %>% 
+  kable_styling(bootstrap_options = "bordered", position = "center", full_width = F)
+rr.hsd <- TukeyHSD(rr.aov)
+
+rr.hsd.df <- rr.hsd$region2 %>% as.data.frame %>% setNames(c("diff","lwr","upr","p.adj"))
+
+rr.hsd.df %>%
+  knitr::kable(format = "html", digits = 3, caption = "Tukey HSD for log.rr ~ region") %>% 
+  row_spec(which(rr.hsd.df$p.adj < 0.05), color = "red") %>%
+  kable_styling(bootstrap_options = "bordered", position = "center", full_width = F)
+
+
+bdgt.aov <- aov(log.bdgt~region2, data = bdg.sel)
+summary(bdgt.aov)[[1]] %>% as.data.frame() %>% knitr::kable(caption = "ANOVA log.bdgt") %>% 
+  kable_styling(bootstrap_options = "bordered", position = "center", full_width = F)
+bdgt.hsd <- TukeyHSD(bdgt.aov)
+
+bdgt.hsd.df <- bdgt.hsd$region2 %>% as.data.frame %>% setNames(c("diff","lwr","upr","p.adj"))
+
+bdgt.hsd.df %>%
+  knitr::kable(format = "html", digits = 3, caption = "Tukey HSD for log.bdgt ~ region") %>% 
+  row_spec(which(bdgt.hsd.df$p.adj < 0.05), color = "red") %>%
+  kable_styling(bootstrap_options = "bordered", position = "center", full_width = F)
+
+```
+
+## PCA 
+
+```{r pca-region, fig.dim = c(24,18)}
+pca.b1 <- prcomp(formula = ~., data = b1[,-which(names(b1) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+library(scales)
+col.pca.vars <- hue_pal()(6)
+
+plot.pca.b1 <- fviz_pca_biplot(pca.b1, title = "PCA 1-South",
+                              habillage = "none", label = "var", col.var = col.pca.vars[1], 
+                             repel = T,arrowsize=1,labelsize=10)+theme_bw(base_size = 35)+theme(legend.position = "none")
+    
+
+pca.b2 <- prcomp(formula = ~., data = b2[,-which(names(b2) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+plot.pca.b2 <- fviz_pca_biplot(pca.b2, title = "PCA 2-East",
+                              habillage = "none", label = "var", col.var = col.pca.vars[2],
+                             repel = T,arrowsize=1,labelsize=10)+theme_bw(base_size = 35)
+
+pca.b3 <- prcomp(formula = ~., data = b3[,-which(names(b3) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+plot.pca.b3 <- fviz_pca_biplot(pca.b3, title = "PCA 3-Mountains",
+                              habillage = "none", label = "var",col.var = col.pca.vars[3],
+                             repel = T,arrowsize=1,labelsize=10)+theme_bw(base_size = 35)
+  
+pca.b4 <- prcomp(formula = ~., data = b4[,-which(names(b4) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+plot.pca.b4 <- fviz_pca_biplot(pca.b4,title = "PCA 4-West",
+                              habillage = "none", label = "var", col.var = col.pca.vars[4],
+                             repel = T,arrowsize=1,labelsize=10)+theme_bw(base_size = 35)
+
+pca.b5 <- prcomp(formula = ~., data = b5[,-which(names(b5) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+plot.pca.b5 <- fviz_pca_biplot(pca.b5, title = "PCA 5-Central",
+                              habillage = "none", label = "var", col.var = col.pca.vars[5],
+                             repel = T,arrowsize=1,labelsize=10)+theme_bw(base_size = 35)
+
+pca.b6 <- prcomp(formula = ~., data = b6[,-which(names(b6) %in% c("region2", "log.rrn"))], center = T, scale. = T)
+
+plot.pca.b6 <- fviz_pca_biplot(pca.b6, title = "PCA 6-North",
+                              habillage = "none", label = "var", col.var = col.pca.vars[6],
+                             repel = T,arrowsize=1,labelsize=10)+theme_bw(base_size = 35)
+
+
+plot_grid(plotlist = list(plot.pca.b1, plot.pca.b2, plot.pca.b3, plot.pca.b4, plot.pca.b5, plot.pca.b6), nrow = 2, ncol = 3)
+```
+
+## Corrplots
+
+```{r corrplot-by-region, fig.dim = c(24,20)}
+
+par(mfrow = c(2,3), cex = 2.5)
+
+p.mat1 <- corrplot::cor.mtest(b1,conf.level=0.95)
+corrplot(cor(b1), type = "lower", method = "color", addCoef.col = "grey", p.mat = p.mat1$p, insig = "blank", diag = F, title = "Region 1: South", mar = c(0,0,1,0))
+
+p.mat2 <- corrplot::cor.mtest(b2,conf.level=0.95)
+corrplot(cor(b2), type = "lower", method = "color", addCoef.col = "grey", p.mat = p.mat2$p, insig = "blank", diag = F, title = "Region 2: East", mar = c(0,0,1,0))
+
+p.mat3 <- corrplot::cor.mtest(b3,conf.level = 0.95)
+corrplot(cor(b3), type = "lower", method = "color", addCoef.col = "grey", p.mat = p.mat3$p, insig = "blank", diag = F, title = "Region 3: Mountains", mar = c(0,0,1,0))
+
+p.mat4 <- cor.mtest(b4,conf.level = 0.95)
+corrplot(cor(b4), type = "lower", method = "color", addCoef.col = "grey", p.mat = p.mat4$p, insig = "blank", diag = F, title = "Region 4: West", mar = c(0,0,1,0))
+
+p.mat5 <- cor.mtest(b5, conf.level = 0.95)
+corrplot(cor(b5), type = "lower", method = "color", addCoef.col = "grey", p.mat = p.mat5$p, insig = "blank", diag = F, title = "Region 5: Central", mar = c(0,0,1,0))
+
+p.mat6 <- cor.mtest(b6, conf.level = 0.95)
+corrplot(cor(b6), type = "lower", method = "color", addCoef.col = "grey", p.mat = p.mat6$p, insig = "blank", diag = F, title = "Region 6: North", mar = c(0,0,1,0))
+```
+
+```{r table-resuts}
+data.frame(region = c("Global","South", "East","Moutains","West","Central","North"), 
+           cor.rr = c("forest, log.ndep, log.cndom, ph, log.fe, log.toc, log.tn, log.tp",
+                      "log.fe, log.toc, log.tn", 
+                      "log.fe, log.toc, log.tn",
+                      "NULL",
+                      "log.cndom, log.toc",
+                      "peat, log.cond, log.fe, log.soil, log.toc, log.tn, log.tp", 
+                      "log.ndep, log.runoff, log.cndom"), 
+           cor.bdgt = c("forest, log.ndep, log.runoff",
+                        "forest, log.ndep, log.runoff, ndvi, log.soil",
+                        "forest, log.ndep, log.runoff, ndvi, log.soil",
+                        "NULL",
+                        "log.cond,log.cndom,ph,log.fe,log.toc,log.tn",
+                        "NULL",
+                        "log.ndep, log.runoff, log.cond, ph")) %>% 
+  kable %>% kable_styling(bootstrap_options = "bordered", position = "center", full_width = F)
+
+```
+
+## Scatterplots
+
+```{r scatterplots, fig.dim = c(9,12)}
+par(mfrow = c(4,3), cex.lab = 3, cex.main = 3)
+plot(log.rr~forest+log.ndep+log.cndom+ph+log.fe+log.toc+log.tn+log.tp, data = bdg.sel, main = "Global, log.rr", col = "cornflowerblue")
+plot(log.bdgt~forest+log.ndep+log.runoff, data = bdg.sel, main = "Global, log.bdgt", col = "brown3")
+
+```
+
+```{r scatterplots-b1, fig.dim = c(9,9)}
+par(mfrow = c(3,3), cex.lab = 3, cex.main = 3)
+plot(log.rr~log.fe + log.toc+log.tn, data = b1, main = "1- South, log.rr", col = "cornflowerblue")
+plot(log.bdgt~forest + log.ndep + log.runoff + ndvi + log.soil, data = b1, main = "1- South, log.bdgt", col = "brown3")
+```
+
+```{r scatterplots-b2, fig.dim = c(9,9)}
+par(mfrow = c(3,3), cex.lab = 3, cex.main = 3)
+plot(log.rr~log.fe + log.toc+log.tn, data = b2, main = "2- East, log.rr", col = "cornflowerblue")
+plot(log.bdgt~forest+log.ndep+log.runoff+ndvi+log.soil, data = b2, main = "2- East, log.bdgt", col = "brown3")
+```
+
+```{r scatterplots-b3, fig.dim = c(9,3)}
+par(mfrow = c(1,3), cex.lab = 3, cex.main = 3)
+plot(log.bdgt~log.soil, data = b3, main = "3- Mountains, log.bdgt", col = "brown3")
+```
+
+```{r scatterplots-b4, fig.dim = c(9,9)}
+par(mfrow = c(3,3), cex.lab = 3, cex.main = 3)
+plot(log.rr~log.cndom + log.toc, data = b4, main = "4- West, log.rr", col = "cornflowerblue")
+plot(log.bdgt~log.cndom + ph + log.fe + log.toc + log.tn, data = b2, main = "4- West, log.bdgt", col = "brown3")
+```
+
+```{r scatterplots-b5, fig.dim = c(9,6)}
+par(mfrow = c(2,3), cex.lab = 3, cex.main = 3)
+plot(log.rr~peat + log.fe + log.soil + log.toc + log.tn + log.tp, data = b5, main = "5- Central, log.rr", col = "cornflowerblue")
+```
+
+```{r scatterplots-b6, fig.dim = c(9,9)}
+par(mfrow = c(3,3), cex.lab = 3, cex.main = 3)
+plot(log.rr~ log.ndep + log.runoff + log.cndom, data = b6, main = "6- North, log.rr", col = "cornflowerblue")
+plot(log.bdgt~ log.ndep + log.runoff + log.cond + ph, data = b6, main = "6- North, log.bdgt", col = "brown3")
+```
+
+## SELM Regions
+
+Formula: ~ log.toc + log.cond + ndvi + log.runoff 
+
+```{r selm-regions, fig.dim = c(15,30)}
+
+rr.fm <- "log.rr~log.toc + log.cond + ndvi + log.runoff" %>% as.formula()
+bdgt.fm <- "log.bdgt~log.toc + log.cond + ndvi + log.runoff" %>% as.formula()
+
+b1.rr.selm <- errorsarlm(formula= rr.fm, b1, b1.kmat)
+p1.rr <- qplot(b1.rr.selm$fitted.values, b1$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y="log.rr", x = "Predicted log.rr", title = "South - SELM log.rr")+
+  theme_minimal(base_size = 30)
+
+b1.bdgt.selm <- errorsarlm(formula= bdgt.fm, b1, b1.kmat)
+p1.bdgt <- qplot(b1.bdgt.selm$fitted.values, b1$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y="log.bdgt", x = "Predicted log.bdgt", title = "South - SELM log.bdgt") +
+  theme_minimal(base_size = 30)
+
+###
+b2.rr.selm <- errorsarlm(formula= rr.fm, b2, b2.kmat)
+p2.rr <- qplot(b2.rr.selm$fitted.values, b2$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y ="log.rr", x = "Predicted log.rr", title = "East - SELM log.rr")+
+  theme_minimal(base_size = 30)
+
+b2.bdgt.selm <- errorsarlm(formula= bdgt.fm, b2, b2.kmat)
+p2.bdgt <- qplot(b2.bdgt.selm$fitted.values, b2$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red") + labs(y="log.bdgt", x = "Predicted log.bdgt", title = "East - SELM log.bdgt")+
+  theme_minimal(base_size = 30)
+
+###
+b3.rr.selm <- errorsarlm(formula= rr.fm, b3, b3.kmat)
+p3.rr <- qplot(b3.rr.selm$fitted.values, b3$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y="log.rr", x = "Predicted log.rr", title = "Moutains - SELM log.rr")+
+  theme_minimal(base_size = 30)
+
+b3.bdgt.selm <- errorsarlm(formula= bdgt.fm, b3, b3.kmat)
+p3.bdgt <- qplot(b3.bdgt.selm$fitted.values, b3$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red") + labs(y="log.bdgt", x = "Predicted log.bdgt", title = "Mountains - SELM log.bdgt")+
+  theme_minimal(base_size = 30)
+
+###
+b4.rr.selm <- errorsarlm(formula= rr.fm, b4, b4.kmat)
+p4.rr <- qplot(b4.rr.selm$fitted.values, b4$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y ="log.rr", x = "Predicted log.rr", title = "West - SELM log.rr")+
+  theme_minimal(base_size = 30)
+
+b4.bdgt.selm <- errorsarlm(formula= bdgt.fm, b4, b4.kmat)
+p4.bdgt <- qplot(b4.bdgt.selm$fitted.values, b4$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red") + labs(y="log.bdgt", x = "Predicted log.bdgt", title = "West - SELM log.bdgt")+
+  theme_minimal(base_size = 30)
+
+###
+b5.rr.selm <- errorsarlm(formula= rr.fm, b5, b5.kmat)
+p5.rr <- qplot(b5.rr.selm$fitted.values, b5$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y="log.rr", x = "Predicted log.rr", title = "Central - SELM log.rr")+
+  theme_minimal(base_size = 30)
+
+b5.bdgt.selm <- errorsarlm(formula= bdgt.fm, b5, b5.kmat)
+p5.bdgt <- qplot(b5.bdgt.selm$fitted.values, b5$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red") + labs(y ="log.bdgt", x = "Predicted log.bdgt", title = "Central - SELM log.bdgt")+
+  theme_minimal(base_size = 30)
+
+###
+b6.rr.selm <- errorsarlm(formula= rr.fm, b6, b6.kmat)
+p6.rr <- qplot(b6.rr.selm$fitted.values, b6$log.rr)+geom_abline(slope = 1, intercept = 0, col = "red")+labs(y="log.rr", x = "Predicted log.rr", title = "North - SELM log.rr")+
+  theme_minimal(base_size = 30)
+
+b6.bdgt.selm <- errorsarlm(formula= bdgt.fm, b6, b6.kmat)
+p6.bdgt <- qplot(b6.bdgt.selm$fitted.values, b6$log.bdgt)+geom_abline(slope = 1, intercept = 0, col = "red") + labs(y="log.bdgt", x = "Predicted log.bdgt", title = "North - SELM log.bdgt")+
+  theme_minimal(base_size = 30)
+
+plot_grid(plotlist = list(p1.rr, p1.bdgt, p2.rr, p2.bdgt, p3.rr, p3.bdgt, p4.rr, p4.bdgt, p5.rr, p5.bdgt, p6.rr, p6.bdgt), nrow = 6, ncol = 2)
+```
+
+
+
+
+
+`r knitr::knit_exit()`
+
+```{r lm by region}
+rr.lm <- lm(log.rr ~ forest + log.ndep + log.cndom + log.soil, data = bdg.sel ) # ph cor with log.ndep, fe+toc+tn cor with cndom
+rr.lm1 <- lm(log.rr ~ log.toc, data = b1) # fe, toc and tn are correlated ~0.95
+rr.lm2 <- lm(log.rr ~ log.toc, data = b2)
+rr.lm3 <- lm(log.rr ~ log.toc, data = b3)
+rr.lm4 <- lm(log.rr ~ log.cndom, data = b4)
+rr.lm5 <- lm(log.rr ~ peat + log.toc, data = b5)
+rr.lm6 <- lm(log.rr ~ log.runoff + log.cndom, data = b6)
+
+bdgt.lm <- lm(log.bdgt ~ forest + log.ndep + log.runoff + log.soil, data = bdg.sel ) # ph cor with log.ndep, fe+toc+tn cor with cndom
+bdgt.lm1 <- lm(log.bdgt ~ forest + log.ndep + log.runoff, data = b1) # fe, toc and tn are correlated ~0.95
+bdgt.lm2 <- lm(log.bdgt ~ forest + log.ndep + log.runoff, data = b2)
+bdgt.lm3 <- lm(log.bdgt ~ ., data = b3)
+bdgt.lm4 <- lm(log.bdgt ~ log.cndom + ph + log.tn, data = b4)
+bdgt.lm5 <- lm(log.bdgt ~ ., data = b5)
+bdgt.lm6 <- lm(log.bdgt ~ log.runoff, log.cond, data = b6)
+
+
+```
+
+
+
+## Model by region
+
+Based on parameters from articles 1 and 2. Catchment parameters are always: tn, peat, runoff, ndvi, agriculture.
+
+Chemistry parameters are 
+For RR: log(C/N), logDP and SUVA
+For RRn: SUVA, log(Fe), SARuv, logDP
+For BdgT: logDOC, pH, SARuv, bacterial abundance. 
+
+We don't have absorbance data so SARuv and SUVA are replaced by cndom.
+
+South (region 4+5), East (1+2), Inland (3), West (region 6+7), Central (region 8) and North (region 9+10)
+
+```{r region-1}
+
+bdg1 <- filter(bdg.sel,region == 1)
+plot(formula = log.rr ~. , data = bdg1)
+
+bdg2 <- filter(bdg.sel,region == 2)
+plot(formula = log.rr ~. , data = bdg2)
+
+bdg3 <- filter(bdg.sel,region == 3)
+plot(formula = log.rr ~. , data = bdg3)
+
+bdg4 <- filter(bdg.sel,region == 4)
+plot(formula = log.rr ~. , data = bdg4)
+
+bdg5 <- filter(bdg.sel,region == 5)
+plot(formula = log.rr ~. , data = bdg5)
+
+bdg6 <- filter(bdg.sel,region == 6)
+plot(formula = log.rr ~. , data = bdg6)
+
+bdg7 <- filter(bdg.sel,region == 7)
+plot(formula = log.rr ~. , data = bdg7)
+
+bdg8 <- filter(bdg.sel,region == 8)
+plot(formula = log.rr ~. , data = bdg8)
+
+bdg9 <- filter(bdg.sel,region == 9)
+plot(formula = log.rr ~. , data = bdg9)
+
+bdg10 <- filter(bdg.sel,region == 10)
+plot(formula = log.rr ~. , data = bdg10)
+
+bdg.south <- filter(bdg.sel, region %in% c(4,5))
+plot(formula = log.rr~., data = bdg.south)
+
+bdg.east <- filter(bdg.sel, region %in% c(1,2))
+plot(formula = log.rr~., data = bdg.east)
+
+bdg.inland <- filter(bdg.sel, region %in% c(3))
+plot(formula = log.rr~., data = bdg.inland)
+
+bdg.west <- filter(bdg.sel, region %in% c(6,7))
+plot(formula = log.rr~., data = bdg.west)
+
+bdg.central <- filter(bdg.sel, region %in% c(8))
+plot(formula = log.rr~., data = bdg.central)
+
+bdg.north <- filter(bdg.sel, region %in% c(9,10))
+plot(formula = log.rr~., data = bdg.central)
+
+lm(formula = log.rr ~ ndvi + log.ndep + peat + agriculture + runoff + cndom + log.toc + log.tn + log.tp , data = bdg1) %>% summary()
+lm(formula = log.rr ~ peat + cndom, data = bdg1) %>% summary()
+
+gam(formula = log.rr ~ ndvi + log.ndep + peat + agriculture + runoff + cndom + log.toc + log.tn + log.tp , data = bdg1) %>% summary()
+
+full.model <- lm(log.rr~ndvi + log.ndep + peat + agriculture + runoff + cndom + log(toc/tn) + log.tp, data = bdg1) 
+summary(full.model)
+step.model <- stepAIC(full.model, direction = "both")
+summary(step.model)
+
+final.model <- lm(log.rr~peat+cndom, data = bdg1)
+summary(final.model)
+
+
+```
+
+## 

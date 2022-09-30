@@ -1,0 +1,614 @@
+---
+title: "Data preparation"
+author: "Camille Crapart"
+date: "25 2 2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = T, collapse = T,  message = F, warning = F, error = F)
+```
+
+```{r libraries}
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(dlookr)
+
+library(sf)
+library(raster)
+library(spatialreg)
+library(spdep)
+
+library(MASS)
+
+library(factoextra)
+
+memory.limit(size = 1e+10)
+
+id.names <- c("station_id","station_code","nve_vatn_nr","nve_vassdrag_nr", "CBA_Lake_ID", "STATION_ID", "statn_d","longitude","latitude", "region")
+is_constant <- function(x) length(unique(x)) == 1L 
+```
+
+# Data preparation 
+
+## Import data from NIVA
+
+```{r load-data-niva, eval = F}
+id.niva <- read_xlsx("id_niva.xlsx")
+
+catchment.poly <- st_read("catchments_poly/lakes1000cat.shp")
+niva.stations <- st_read("catchments_poly/lakes1000stations.shp")
+niva.data <- read_xlsx("niva_selection.xlsx", sheet = "niva")
+
+all.niva <- st_drop_geometry(niva.stations) %>% merge(niva.data, by.x = "sttn_cd", by.y = "station_code") %>% merge(catchment.poly, by.x = "statn_d", by.y= "station_id")
+
+#bdg.stations <- id.niva %>% merge(niva.stations, by.x = "STATION_ID", by.y = "sttn_cd") %>% merge(niva.data, by.x = "STATION_ID", by.y = "station_code")
+bdg.niva <- id.niva %>% merge(all.niva, by.x = "STATION_ID", by.y = "sttn_cd") %>% st_as_sf()
+
+missing.bdg <- id.niva %>% filter(!STATION_ID %in% bdg.niva$STATION_ID)
+
+saveRDS(bdg.niva, "bdg.niva.rds")
+```
+
+```{r plot-niva-catchments}
+ggplot(bdg.niva)+geom_sf(aes(fill = as.factor(region), col = as.factor(region)))+
+  scale_color_brewer(palette = "Spectral", aesthetics = c("col","fill"))+
+  theme_minimal(base_size = 8)
+
+ggplot(bdg.niva)+geom_point(aes(x = longitude, y = latitude, col = as.factor(region)))+
+  scale_color_brewer(palette = "Spectral", aesthetics = c("col","fill"))+
+  theme_minimal(base_size = 8)
+
+```
+
+Region 1: 
+Hedmark
+Oppland
+
+Region 2: 
+Telemark
+Buskerud
+Vestfold
+Østfold
+Akershus
+Hedmark
+Oppland
+
+Region 3
+Telemark
+Oppland
+Buskerud
+Sogn of Fjordane
+Hordaland
+
+Region 4
+Aust-Agder
+Telemark
+Vest-Agder
+
+Region 5
+Rogaland
+Vesst-Agder
+Hordaland
+
+Region 6
+Hordaland
+Rogaland
+Sogn og Fjordane   
+
+Region 7
+Hordaland
+Sogn og Fjordane
+
+Region 8 
+Sør-Trøndelag
+Møre og Romsdal
+Nord-Trondelag
+
+Region 9 
+Troms
+Nordland
+Finmark
+
+Region 10
+Finmark
+
+Missing data comes from the excel file from Heleen.
+
+## Extract NDVI 2019 
+
+```{r extract-ndvi, eval = F}
+copernicus.files <- list.files(path = "Summer_NDVI_2019", pattern = "1.nc", full.names = T)
+
+copernicus.stack <- raster::stack(copernicus.files, varname = "NDVI")
+copernicus.fennoscandia <- raster::crop(copernicus.stack, c(0,35,55,73))
+copernicus.mean <- copernicus.fennoscandia %>% stackApply(indices = c(1:length(copernicus.files)), fun = mean, na.rm = T)
+
+copernicus.fen <- copernicus.fennoscandia %>% mean()
+
+niva.ndvi <- raster::extract(copernicus.fen, catchments.bdg, sp = T, fun = mean, df = T, na.rm = T)
+names(niva.ndvi) <- c("station_id", "ndvi")
+saveRDS(niva.ndvi, "Summer_NDVI_2019/niva.ndvi.rds")
+```
+
+## Soil
+
+Soil thickness: extracted from ORNL DAAC: https://daac.ornl.gov/SOILS/guides/Global_Soil_Regolith_Sediment.html 
+
+Chose the average value: "average_soil_and_sedimentary-deposit_thickness.tif"
+-> A grid that averages soil and sedimentary deposit thicknesses in meters for users who want a single thickness value that averages across upland hillslope and valley bottoms.
+
+```{r extract-soil-depth, eval = F}
+soil <- raster::raster("DAAC/average_soil_and_sedimentary-deposit_thickness.tif")
+catchment.poly <- st_read("catchments_poly/lakes1000cat.shp")
+soil.df <- extract(soil, catchment.poly, sp = T, df = T, na.rm = T, fun = mean)
+names(soil.df) <- c("station_id","soil")
+saveRDS(soil.df, "soil.df.rds")
+```
+
+## Gather dataset
+
+```{r niva-sel, eval = F}
+bdg.niva <- readRDS("bdg.niva.rds")
+explore.niva <- bdg.niva[,-which(names(bdg.niva) %in% id.names)] %>% select_if(is.numeric) %>% st_drop_geometry()
+explore.niva <- explore.niva[,apply(explore.niva, 2, var, na.rm = T) != 0]
+
+niva.prcomp <- prcomp(~., data = explore.niva, center = T, scale. = T)
+niva.pca.var <- fviz_pca_var(niva.prcomp, col.ind = "contrib")
+print(niva.pca.var)
+
+apply(explore.niva, 2, find_na)
+```
+
+```{r create-dataset, eval = F}
+niva.ndvi <- readRDS("Summer_NDVI_2019/niva.ndvi.rds")
+bdg.niva <- readRDS("bdg.niva.rds")
+soil <- readRDS("soil.df.rds")
+nor <- st_read("Country_shapefile/norway.shp") %>% st_transform(st_crs(bdg.niva))
+  
+rr <- read_xlsx("RR1000s.xlsx")
+rr$...1 <- NULL
+
+keep <- c("latitude", "longitude", "region", "ph_2019","tg_6m_19","kond_2019","toc_2019","cndom_corr_2019", "era_prec_2019", "rr_2m_19","mean_elev","nilu_ndep_2012_2016","nilu_sdep_2012_2016","freshwater","forest","agriculture","peat","basin_area_km2")
+
+bdg.data <- bdg.niva[,which(names(bdg.niva) %in% c(id.names,keep))] %>% merge(dplyr::select(rr,c("Sample_ID","dmax","hwidth")), by.x = "CBA_Lake_ID", by.y = "Sample_ID") %>%  merge(niva.ndvi, by.x = "statn_d", by.y = "station_id") %>% merge(soil, by.x = "statn_d", by.y = "station_id")
+
+bdg.data$bdg <- bdg.data$dmax/bdg.data$toc_2019
+
+saveRDS(bdg.data,"bdg.data.rds")
+```
+
+
+# Analysis
+
+# Bdg by region
+
+```{r boxplot-by-region, fig.dim = c(20,10)}
+bdg.data <- readRDS("bdg.data.rds")
+
+ggplot(bdg.data)+geom_boxplot(aes(y=bdg))+facet_grid(cols=vars(region))+theme_minimal()
+ggplot(bdg.data)+geom_boxplot(aes(y=hwidth))+facet_grid(cols=vars(region))+theme_minimal()
+ggplot(bdg.data)+geom_boxplot(aes(y=dmax))+facet_grid(cols=vars(region))+theme_minimal()
+```
+
+## PCA
+
+The PCA shows that the different variables for runoff, temperature and atmospheric deposition point to the same directions. Only the parameter with the least NA from each category is kept.
+
+* rr_2m_19 for runoff
+* tg_6m_19 (most correlated with laketemp_19)
+* nilu_ndep_2012_2016 also for sdep
+
+The data from 1995 are not useful and include many NA.
+
+"Dyp" (deepness) also have many missing data (18). 
+
+We keep toc and cndom for now. 
+
+```{r check-selection}
+bdg.data <- readRDS("bdg.data.rds")
+
+keep <- c("bdg","dmax","hwidth","ph_2019","tg_6m_19","kond_2019","toc_2019","cndom_corr_2019", "era_prec_2019", "rr_2m_19","mean_elev","nilu_ndep_2012_2016","nilu_sdep_2012_2016","freshwater","forest","agriculture","peat","basin_area_km2")
+
+sel2 <- bdg.data[,keep] %>% st_drop_geometry()
+pca2 <- prcomp(~., data = sel2, center = T, scale. = T)
+plot2 <- fviz_pca_var(pca2, col.ind = "contrib")
+print(plot2)
+```
+
+## Correlation
+
+```{r correlations}
+bdg.data <- readRDS("bdg.data.rds")
+
+matrix <- bdg.data[,-which(names(bdg.data) %in% id.names)] %>% st_drop_geometry()
+
+cor.pred <- cor(matrix, use = "pairwise.complete.obs")
+
+png("pred.corrplot.png")
+corrplot::corrplot(cor.pred, type = "lower", tl.cex = 0.8)
+dev.off()
+
+corrplot::corrplot(cor.pred, type = "lower", tl.cex = 0.8)
+```
+
+## Transform dataset
+
+```{r skewness, eval = F}
+bdg.data <- readRDS("bdg.data.rds")
+
+bdg.df <- bdg.data[,- which(names(bdg.data) %in% id.names[-which(id.names %in% c("CBA_Lake_ID","longitude","latitude","region"))])] %>% st_drop_geometry()
+
+skewed.data <- find_skewness(bdg.df, index = F)
+
+bdg.trans <- bdg.df
+for(i in skewed.data){
+  newname <- paste("log",i, sep = ".")
+  oldnames <- names(bdg.trans)
+  bdg.trans <<- cbind(bdg.trans, log(bdg.trans[[i]])) %>% setNames(c(oldnames,newname))
+}
+
+# bdg.trans <- bdg.data %>% mutate_at(.funs = transform, method = "log", .vars = skewed.data) %>% st_drop_geometry()
+# sapply(bdg.trans,"class")
+# bdg.trans[,which(names(bdg.trans) %in% skewed.data)] <- as.numeric(bdg.trans[,which(names(bdg.trans) %in% skewed.data)])
+# 
+# skewed.index <- which(names(bdg.trans) %in% skewed.data)
+# names(bdg.trans)[skewed.index] <- paste("log",skewed.data,sep = ".")
+
+find_na(bdg.trans, index = F)
+bdg.trans <- bdg.trans %>%  filter(is.na(log.nilu_ndep_2012_2016) == F) %>% filter(is.na(log.cndom_corr_2019)==F) %>% filter(log.soil != -Inf) %>% filter(log.hwidth != -Inf)
+
+bdg.trans$log.agriculture <- NULL
+bdg.trans$log.forest <- NULL
+bdg.trans$log.peat <- NULL
+bdg.trans$log.ndvi <- NULL
+
+saveRDS(bdg.trans,"bdg.trans.rds")
+```
+
+```{r outliers}
+library(outliers)
+outliers <- bdg.trans %>% find_outliers(index = F)
+gt.outliers <- apply(bdg.trans[outliers],2, grubbs.test, two.sided = T)
+```
+
+## LogBdg by region
+
+```{r boxplot-by-region, fig.dim = c(20,10)}
+bdg.trans <- readRDS("bdg.trans.rds")
+
+ggplot(bdg.trans)+geom_boxplot(aes(y=log.bdg))+facet_grid(cols=vars(region))+theme_minimal()
+ggplot(bdg.trans)+geom_boxplot(aes(y=log.hwidth))+facet_grid(cols=vars(region))+theme_minimal()
+ggplot(bdg.trans)+geom_boxplot(aes(y=log.dmax))+facet_grid(cols=vars(region))+theme_minimal()
+```
+
+## Model by region
+
+```{r region-1}
+
+bdg1 <- filter(bdg.trans,region == 1)
+
+lm(formula = log.dmax ~ ndvi + log.nilu_ndep_2012_2016 + SUVA, data = bdg1) %>% summary()
+
+library(MASS)
+preds <- c("log.bdg","agriculture","forest","peat","log.nilu_ndep_2012_2016","ph_2019","log.kond_2019", "log.toc_2019", "log.cndom_corr_2019","log.ndvi")
+full.model <- lm(log.bdg~., data = bdg1[preds]) 
+summary(full.model)
+step.model <- stepAIC(full.model, direction = "both")
+summary(step.model)
+
+final.model <- lm(log.bdg~mean_elev+log.basin_area_km2+log.nilu_sdep_2012_2016, data = bdg1)
+summary(final.model)
+
+```
+
+
+# Extra code
+
+## Boxplot
+
+```{r other-boxplots}
+toplot <- names(bdg.trans)
+predictors.boxplots <- lapply(toplot, function(x) ggplot(bdg.trans) + geom_boxplot(aes(y = .data[[x]]), outlier.size = 0.3, lwd = 0.2) + theme_minimal(base_size = 10))
+
+all.boxplots <- cowplot::plot_grid(plotlist = predictors.boxplots, ncol = 5)
+cowplot::save_plot("predictors.boxplots.png", all.boxplots, base_asp = 0.8)
+```
+
+Outliers detection : https://statsandr.com/blog/outliers-detection-in-r/
+
+## Paired scatterplots
+
+```{r scatterplots}
+toplot <- c("log.bdg", "log.dmax", "log.hwidth","mean_elev","agriculture","forest","peat","freshwater","log.basin_area_km2","log.soil","log.nilu_ndep_2012_2016","log.nilu_sdep_2012_2016","log.rr_2m_19","ph_2019","log.kond_2019", "log.toc_2019", "log.cndom_corr_2019","log.ndvi")
+pairs(bdg.trans[toplot], cor = T, cex = 0.01)
+```
+
+```{r maps-predictors}
+bdg.trans <- readRDS("bdg.trans.rds")
+nor <- st_read("Country_shapefile/norway.shp")# %>% st_transform(st_crs(bdg.trans))
+
+for(i in c("log.toc_2019","log.bdg","log.dmax","log.hwidth")){
+  g <- ggplot()+geom_sf(data = nor, fill = "white")+geom_point(data = bdg.trans, aes(x = longitude, y = latitude, col = .data[[i]]))+
+  scale_color_distiller(type = "seq", palette = 4, direction = 1)+theme_void(base_size = 25)+theme(legend.position = "bottom")
+  ggsave(plot = g, filename = paste("map", i, "png",sep = "."))
+}  
+```
+
+
+
+# Test models
+
+```{r stepwise-regression-bdg}
+library(MASS)
+preds <- c("log.bdg","mean_elev","agriculture","forest","peat","freshwater","log.basin_area_km2","log.soil","log.nilu_ndep_2012_2016","log.nilu_sdep_2012_2016","log.rr_2m_19","ph_2019","log.kond_2019", "log.toc_2019", "log.cndom_corr_2019","log.ndvi")
+full.model <- lm(log.bdg~., data = bdg.trans[preds])
+step.model <- stepAIC(full.model, direction = "both")
+summary(step.model)
+
+final.model <- lm(log.bdg~mean_elev+log.basin_area_km2+log.nilu_sdep_2012_2016, data = bdg.trans)
+summary(final.model)
+final.model.toc <- lm(log.toc_2019~mean_elev+log.basin_area_km2+log.nilu_sdep_2012_2016, data = bdg.trans)
+summary(final.model.toc)
+```
+
+```{r stepwise-regression-dmax}
+library(MASS)
+preds <- c("log.dmax","mean_elev","agriculture","forest","peat","freshwater","log.basin_area_km2","log.soil","log.nilu_ndep_2012_2016","log.nilu_sdep_2012_2016","log.rr_2m_19","ph_2019","log.kond_2019", "log.toc_2019", "log.cndom_corr_2019","log.ndvi")
+full.model <- lm(log.dmax~., data = bdg.trans[preds])
+step.model <- stepAIC(full.model, direction = "both")
+summary(step.model)
+
+final.model <- lm(log.dmax~mean_elev+log.nilu_sdep_2012_2016+ph_2019, data = bdg.trans)
+summary(final.model)
+final.model.toc <- lm(log.toc_2019~mean_elev+log.basin_area_km2+log.nilu_sdep_2012_2016, data = bdg.trans)
+summary(final.model.toc)
+```
+
+```{r stepwise-regression-hwidth}
+library(MASS)
+preds <- c("log.hwidth","mean_elev","agriculture","forest","peat","freshwater","log.basin_area_km2","log.soil","log.nilu_ndep_2012_2016","log.nilu_sdep_2012_2016","log.rr_2m_19","ph_2019","log.kond_2019", "log.toc_2019", "log.cndom_corr_2019","log.ndvi")
+full.model <- lm(log.hwidth~., data = bdg.trans[preds])
+step.model <- stepAIC(full.model, direction = "both")
+summary(step.model)
+
+final.model <- lm(log.hwidth~mean_elev+forest+log.nilu_sdep_2012_2016+ph_2019, data = bdg.trans)
+summary(final.model)
+
+library(mgcv)
+poly.model <- gam(log.hwidth~s(mean_elev)+s(forest)+s(log.nilu_sdep_2012_2016)+s(ph_2019), data = bdg.trans)
+summary(poly.model)
+
+```
+
+```{r early-exit}
+knitr::knit_exit(fully = F)
+```
+
+```{r lm-test}
+test1 <- lm(formula = log.dmax~log.nilu_sdep_2012_2016+log.toc_2019+ph_2019, data = bdg.trans)
+summary(test1)
+plot(test1)
+
+test2 <- lm(formula = log.dmax~forest+log.rr_2m_19+peat, data = bdg.trans)
+summary(test2)
+plot(test2)
+
+test3 <- lm(formula = log.hwidth~era_prec_2019+log.toc_2019, data = bdg.trans)
+summary(test3)
+plot(test3)
+
+test4 <- lm(formula = log.hwidth~forest+log.rr_2m_19+peat, data = bdg.trans)
+summary(test4)
+plot(test4)
+
+test5 <- lm(formula = log.hwidth~log.ndvi+log.rr_2m_19+peat, data = bdg.trans)
+summary(test5)
+plot(test5)
+
+test6 <- lm(formula = log.bdg~log.ndvi+log.rr_2m_19+peat+log.soil, data = bdg.trans)
+summary(test6)
+plot(test6)
+plot(bdg.trans$log.bdg, test6$fitted.values)+abline(a=0,b=1)
+
+```
+
+```{r kmat}
+bdg.trans.sf <- merge(bdg.data,bdg.trans, by = "CBA_Lake_ID")
+bdg.centroid <- st_centroid(bdg.trans.sf, of_largest_polygon = T)
+
+bdg.kmat <- knearneigh(bdg.centroid, k = 50) %>% knn2nb() %>% nb2listw() 
+saveRDS(bdg.kmat,"bdg.kmat.rds")
+
+```
+
+```{r selm1}
+bdg.kmat <- readRDS("bdg.kmat.rds")
+selm1 <- errorsarlm(formula = log.dmax~log.nilu_sdep_2012_2016+log.toc_2019+ph_2019, data = bdg.trans, listw = bdg.kmat)
+
+boxplot(selm1$residuals)
+qqnorm(selm1$residuals)
+
+plot(selm1$fitted.values, selm1$residuals)
+
+comp1 <- cbind(bdg.trans$log.dmax, selm1$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp1)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```
+
+```{r selm2}
+selm2 <- errorsarlm(formula = log.dmax~log.rr_2m_19+log.ndvi+peat, data = bdg.trans, listw = bdg.kmat)
+
+boxplot(selm2$residuals)
+qqnorm(selm2$residuals)
+
+plot(selm2$fitted.values, selm2$residuals)
+
+comp2 <- cbind(bdg.trans$log.dmax, selm2$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp2)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) +theme_minimal()
+
+```
+
+```{r selm3}
+selm3 <- errorsarlm(formula = log.hwidth~era_prec_2019+log.toc_2019, data = bdg.trans, listw = bdg.kmat)
+
+boxplot(selm3$residuals)
+qqnorm(selm3$residuals)
+
+plot(selm3$fitted.values, selm3$residuals)
+
+comp3 <- cbind(bdg.trans$log.dmax, selm3$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp3)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```
+```{r selm4}
+selm4 <- errorsarlm(formula = log.hwidth~forest+log.rr_2m_19+peat, data = bdg.trans, listw = bdg.kmat)
+
+boxplot(selm4$residuals)
+qqnorm(selm4$residuals)
+
+plot(selm4$fitted.values, selm4$residuals)
+
+comp4 <- cbind(bdg.trans$log.dmax, selm4$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp4)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```
+
+```{r selm5}
+bdg.kmat <- readRDS("bdg.kmat.rds")
+selm5 <- errorsarlm(formula = log.bdg~log.ndvi+log.rr_2m_19+peat+log.soil, data = bdg.trans, listw = bdg.kmat)
+
+boxplot(selm5$residuals)
+qqnorm(selm5$residuals)
+
+plot(selm5$fitted.values, selm5$residuals)
+
+comp5 <- cbind(bdg.trans$log.dmax, selm5$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp5)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```
+
+
+```{r skewness2}
+bdg.data <- readRDS("bdg.data.rds")
+
+bdg.df <- bdg.data[,- which(names(bdg.data) %in% id.names)] %>% st_drop_geometry()
+
+skewed.data <- find_skewness(bdg.df, index = F)
+
+bdg.trans2 <- bdg.data %>% mutate_at(.funs = "log", .vars = skewed.data[-which(skewed.data %in% c("agriculture","forest","peat"))]) %>% st_drop_geometry()
+
+skewed.index <- which(names(bdg.trans2) %in% skewed.data[-which(skewed.data %in% c("agriculture","forest","peat"))])
+names(bdg.trans2)[skewed.index] <- paste("log",skewed.data[-which(skewed.data %in% c("agriculture","forest","peat"))],sep = ".")
+
+find_na(bdg.trans2, index = F)
+bdg.trans2 <- bdg.trans2 %>%  filter(is.na(log.nilu_ndep_2012_2016) == F) %>% filter(is.na(log.nilu_sdep_2012_2016) == F) %>% filter(is.na(log.cndom_corr_2019)==F) %>% filter(log.hwidth != "-Inf")
+
+```
+
+
+```{r boxplot}
+toplot <- names(bdg.trans2)[-which(names(bdg.trans2) %in% id.names)]
+predictors.boxplots2 <- lapply(toplot, function(x) ggplot(bdg.trans2) + geom_boxplot(aes(y = .data[[x]]), outlier.size = 0.4, lwd = 0.2) + theme_minimal(base_size = 10))
+
+all.boxplots2 <- cowplot::plot_grid(plotlist = predictors.boxplots2, ncol = 3)
+cowplot::save_plot("predictors.boxplots2.png", all.boxplots2)
+
+cor.pred <- cor(bdg.trans2[,toplot], use = "pairwise.complete.obs")
+corrplot::corrplot(cor.pred, type = "lower", tl.cex = 0.8)
+```
+
+
+
+```{r outliers2, eval = F}
+library(outliers)
+outliers2 <- bdg.trans2[,- which(names(bdg.trans2) %in% id.names)] %>% find_outliers(index = F) 
+apply(bdg.trans2[,- which(names(bdg.trans2) %in% id.names)], 2, grubbs.test, two.sided = T)
+
+library(EnvStats)
+rt.dmax <- rosnerTest(bdg.trans2$log.dmax, k = 1)
+```
+
+```{r kmat2}
+bdg.trans.sf <- merge(bdg.data,bdg.trans2, by = "CBA_Lake_ID")
+bdg.centroid <- st_centroid(bdg.trans.sf, of_largest_polygon = T)
+
+bdg.neigh.set <- knearneigh(bdg.centroid, k = 50)
+bdg.neigh.nb <- knn2nb(bdg.neigh.set)
+bdg.kmat2 <- nb2listw(bdg.neigh.nb)
+saveRDS(bdg.kmat2,"bdg.kmat2.rds")
+
+```
+```{r map-data-trans2, eval = F}
+bdg.kmat2 <- readRDS("bdg.kmat2.rds")
+
+lapply(names(select_if(bdg.trans2, is.numeric)), function (x) ggplot(bdg.trans2)+geom_point(aes(x = longitude, y = latitude, col = .data[[x]])) + scale_color_viridis_c() + theme_minimal()+borders(regions = "Norway",xlim=c(0,35),ylim=c(55,73)))
+ggplot(bdg.trans2)+geom_point(aes(x = longitude, y = latitude, col = log.dmax)) + scale_color_viridis_c() + theme_minimal()
+
+#moran.test
+morani <- lapply(names(select_if(bdg.trans2, is.numeric)), function (x) moran.test(bdg.trans2[,x], listw = bdg.kmat2))
+names(morani) <- names(select_if(bdg.trans2, is.numeric))
+```
+
+```{r selm1-bis}
+selm1 <- errorsarlm(formula = log.dmax~log.nilu_sdep_2012_2016+log.toc_2019+ph_2019, data = bdg.trans2, listw = bdg.kmat2)
+
+boxplot(selm1$residuals)
+qqnorm(selm1$residuals)
+
+plot(selm1$fitted.values, selm1$residuals)
+
+comp1 <- cbind(bdg.trans2$log.dmax, selm1$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp1)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```
+```{r selm2-bis, eval = F}
+selm2 <- errorsarlm(formula = log.dmax~log.rr_2m_19+log.ndvi+peat, data = bdg.trans2, listw = bdg.kmat)
+
+boxplot(selm2$residuals)
+qqnorm(selm2$residuals)
+
+plot(selm2$fitted.values, selm2$residuals)
+
+comp2 <- cbind(bdg.trans2$log.dmax, selm2$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp2)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) +theme_minimal()
+
+```
+```{r selm-12, eval = F}
+selm12 <- errorsarlm(formula = log.dmax~log.rr_2m_19+log.ndvi+peat+log.nilu_sdep_2012_2016+log.toc_2019+ph_2019, data = bdg.trans2, listw = bdg.kmat2)
+
+boxplot(selm12$residuals)
+qqnorm(selm12$residuals)
+
+plot(selm12$fitted.values, selm12$residuals)
+
+comp12 <- cbind(bdg.trans2$log.dmax, selm12$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp12)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) +theme_minimal()
+```
+
+```{r selm3-bis, eval = F}
+selm3 <- errorsarlm(formula = log.hwidth~log.toc_2019 + ph_2019+log.cndom_corr_2019, data = bdg.trans2, listw = bdg.kmat)
+
+boxplot(selm3$residuals)
+qqnorm(selm3$residuals)
+
+plot(selm3$fitted.values, selm3$residuals)
+
+comp3 <- cbind(bdg.trans2$log.dmax, selm3$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp3)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```
+```{r selm4-bis, eval = F}
+selm4 <- errorsarlm(formula = log.hwidth~forest+log.rr_2m_19+peat, data = bdg.trans2, listw = bdg.kmat)
+
+boxplot(selm4$residuals)
+qqnorm(selm4$residuals)
+
+plot(selm4$fitted.values, selm4$residuals)
+
+comp4 <- cbind(bdg.trans$log.dmax, selm4$fitted.values) %>% as.data.frame() %>% setNames(c("observed", "fitted"))
+ggplot(comp4)+geom_point(aes(x = observed, y = fitted))+geom_abline(slope = 1, intercept = 0) + theme_minimal()
+
+```

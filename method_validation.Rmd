@@ -1,0 +1,111 @@
+---
+title: "method_validation"
+author: "Camille Crapart"
+date: '2022-09-29'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache = F, collapse = T,  message = F, warning = F, error = F)
+```
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(lme4)
+
+memory.limit(size = 1e+10)
+
+id.names <- c("station_id","station_code","nve_vatn_nr","nve_vassdrag_nr", "CBA_Lake_ID", "STATION_ID", "statn_d","longitude","latitude", "region", "region2")
+is_constant <- function(x) length(unique(x)) == 1L 
+```
+
+# Full dataset
+
+```{r merged.rr, eval = F}
+allsamples <- read.csv("All_samples.csv")
+rrtotal <- read.csv("RRtotal.csv")
+
+merged.rr <- merge(allsamples, rrtotal, by = c("Sample_ID", "Survey"))
+
+merged.rr$X <- NULL
+merged.rr$line <- NULL
+
+newdate <- paste("20",substr(merged.rr$Start_date,1,2),"/",substr(merged.rr$Start_date,3,4),"/",substr(merged.rr$Start_date,5,6), sep = "")
+merged.rr$exp.date <- as.Date(newdate)
+
+write.csv(merged.rr, "merged.rr.csv")
+```
+
+```{r plot-diff-dmax}
+
+merged.rr <- read.csv("merged.rr.csv")
+ggplot(merged.rr)+geom_point(aes(x = hwidth, y = dmax, shape = Who, col = Comments))+facet_grid(rows = vars(Who))+theme_minimal()
+
+ggplot(merged.rr)+geom_point(aes(x = hwidth, y = dmax, col = exp.date))+facet_grid(cols=vars(Who))+theme_minimal()
+
+```
+
+```{r merge-niva-data, eval = F}
+bdg.niva <- readRDS("bdg.niva.rds") %>% 
+  dplyr::select(c("STATION_ID","CBA_Lake_ID","LAKE_NAME","SAMPLED_DATE","longitd","latitud","lake_area_km2","basin_area_km2","mar_limit","mean_elev","developed","agriculture","forest","natural_not_forest","peat","glacier","freshwater","sea","era_prec_2019","nilu_ndep_2012_2016","nilu_sdep_2012_2016","Dyp","rr_2m_19","tg_2m_19","doc_c_2019","kond_2019","toc_2019","ph_2019","tn_2019","tp_2019","region2","geometry")) 
+
+waterchem <- read_xlsx("waterchem.xlsx") %>% 
+  dplyr::select(c("Sample_ID","date","lat","long","DOC","TOC","cond_µS.m","pH","TN","TP")) %>%
+  setNames(c("Sample_ID","SAMPLED_DATE","latitud","longitd","doc_c_2019","toc_2019","kond_2019","ph_2019","tn_2019","tp_2019")) %>%
+  as.data.frame()# 100 lakes
+
+rrniva <- merge(merged.rr, bdg.niva, by.x = "Sample_ID", by.y = "CBA_Lake_ID")
+rrcba <- rrniva %>% filter(Survey == "100_lakes") %>% merge(waterchem, by = "Sample_ID")
+
+remove <- grep("\\.x",names(rrcba))
+rrcba <- rrcba[,-remove]
+rename <- gsub("\\.y",x = names(rrcba), replacement = "")
+names(rrcba) <- rename
+
+rr_comp <- rbind(filter(rrniva, Survey == "1000_lakes"),rrcba)
+rr_comp$SAMPLED_DATE <- as.Date(rr_comp$SAMPLED_DATE)
+
+rr_comp$diff.date <- rr_comp$exp.date - rr_comp$SAMPLED_DATE
+rr_comp$diff.week <- difftime(rr_comp$exp.date, rr_comp$SAMPLED_DATE, units = "weeks") %>% round(digits = 0)
+
+saveRDS(rr_comp,"rr_comp.rds")
+```
+
+```{r plot-diff}
+
+rr_comp <- readRDS("rr_comp.rds")
+
+ggplot(rr_comp)+geom_point(aes(x=diff.date, y = dmax, col = Who, shape = region2))+facet_grid(cols=vars(Survey))
+
+ggplot(rr_comp)+geom_point(aes(x=SAMPLED_DATE,y=exp.date, col = dmax))
+
+ggplot(rr_comp)+geom_boxplot(aes(x=Survey, y = diff.date))+geom_jitter(aes(x=Survey, y = diff.date, col = latitud))+theme_minimal()
+
+
+common_id <- filter(rr_comp, Survey == "100_lakes") %>% pull("Sample_ID")
+  
+ggplot(filter(rr_comp, Sample_ID %in% common_id))+geom_point(aes(x=as.factor(Sample_ID), y = dmax, col = Survey))
+
+qplot(x = filter(rr_comp, Sample_ID %in% common_id & Survey == "100_lakes")$dmax, y = filter(rr_comp, Sample_ID %in% common_id & Survey == "1000_lakes")$dmax, colour = as.factor(filter(rr_comp, Sample_ID %in% common_id& Survey == "1000_lakes")$diff.week))+labs(x="RR 100 lakes", y = "RR 1000 lakes", col = "Diff time weeks")+theme_minimal()
+
+```
+
+
+```{r sort-df, fig.dim = c(20,10)}
+rrcompsc <- subset(rr_comp, log(dmax)> 0)
+rrcompsc$logdmaxsc <- rrcompsc$dmax %>% log %>% scale()
+rrcompsc$logtocsc <- rrcompsc$toc_2019 %>% log %>% scale()
+
+
+ggplot(rrcompsc)+geom_line(aes(x=as.factor(Sample_ID), y = logdmaxsc, col = Survey))+theme_minimal(base_size = 30)
+```
+
+```{r mixed-model-date}
+library(lme4)
+
+
+summary(lme0  <- lmer(logdmaxsc ~ logtocsc + (1 | region2) + (1 | Sample_ID) + (1 | diff.week), data=rrcompsc))
+
+```
