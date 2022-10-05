@@ -95,16 +95,16 @@ qplot(x = filter(rr_comp, Sample_ID %in% common_id & Survey == "100_lakes")$dmax
 
 ```{r sort-df, fig.dim = c(20,10)}
 rr_comp <- readRDS("rr_comp.rds")
-rrcompsc <- subset(rr_comp, log(dmax)> 0)
-rrcompsc <- subset(rr_comp, log(hwidth)> 0)
-rrcompsc$logdmaxsc <- rrcompsc$dmax %>% log %>% scale()
-rrcompsc$loghwidthsc <- rrcompsc$hwidth %>% log %>% scale()
-rrcompsc$logtocsc <- rrcompsc$toc_2019 %>% log %>% scale()
+rrcompsc <- subset(rr_comp, log(dmax)> 0) %>% subset(log(hwidth)> 0)
+rrcompsc$logdmaxsc <- rrcompsc$dmax %>% log %>% scale
+rrcompsc$loghwidthsc <- rrcompsc$hwidth %>% log %>% scale
+rrcompsc$logtocsc <- rrcompsc$toc_2019 %>% log %>% scale
 
 
 ggplot(rrcompsc)+geom_line(aes(x=as.factor(Sample_ID), y = logdmaxsc, col = Survey))+labs(x = "Sample ID", y = "RR, log and scaled")+theme_minimal(base_size = 30)
 ggplot(rrcompsc)+geom_line(aes(x=as.factor(Sample_ID), y = loghwidthsc, col = Survey))+labs(x = "Sample ID", y = "BdgT, log and scaled")+theme_minimal(base_size = 30)
 
+saveRDS(rrcompsc, "rrcompsc.rds")
 ```
 
 ```{r plot-rr, fig.dim = c(20,10)}
@@ -112,18 +112,19 @@ ggplot(rrcompsc)+geom_line(aes(y=latitud, x = logdmaxsc, col = Survey, group = S
   labs(y = "Latitude", x = "RR, log and scaled")+theme_minimal(base_size = 30)+
   theme_minimal(base_size = 30)
 
-ggplot(rrcompsc)+geom_line(aes(y=latitud, x = logdmaxsc, col = Survey, group = Sample_ID))+
-  labs(y = "Latitude", x = "RR, log and scaled")+theme_minimal(base_size = 30)+
+ggplot(rrcompsc)+geom_line(aes(y=latitud, x = loghwidthsc, col = Survey, group = Sample_ID))+
+  labs(y = "Latitude", x = "BsgT, log and scaled")+theme_minimal(base_size = 30)+
   theme_minimal(base_size = 30)
 
 ```
 
 ```{r mixed-model-date}
-summary(lme0  <- lmer(logdmaxsc ~ logtocsc + (1 | region2) + (1 | Sample_ID) + (1 | diff.week), data=rrcompsc))
+summary(lme0  <- lmer(logdmaxsc ~ 1 + (1 | region2/Sample_ID) + (1 | diff.week), data=rrcompsc))
 ```
 
 ```{r sd-sample}
 rrsum <- rrcompsc %>% group_by(Sample_ID,Survey) %>% summarize(rr_mean = mean(dmax), rr_sd = sd(dmax), rr_median = median(dmax), bdgt_mean = mean(hwidth), bdgt_sd = sd(hwidth), bdgt_median = median(hwidth))
+saveRDS(rrsum, "rrsum.rds")
 
 hist(rrsum$rr_sd)
 hist(rrsum$bdgt_sd)
@@ -133,10 +134,13 @@ boxplot(rrsum$bdgt_sd)
 
 rrcompsum <- merge(rrcompsc, rrsum, by = c("Sample_ID", "Survey"))
 
+
 hist(rrcompsum$rr_sd)
 hist(log(rrcompsum$rr_sd))
 rrcompsum$logrrsdsc <- rrcompsum$rr_sd %>% log %>% scale
 summary(lme2  <- lmer(logrrsdsc ~ 1 + (1 | region2) + (1 | Who) + (1 | Sample_ID), data=rrcompsum))
+
+saveRDS(rrcompsum, "rrcompsum.rds")
 ```
 
 ```{r plot-sample-dmax, fig.dim = c(20,10)}
@@ -149,7 +153,7 @@ ggplot(rrcompsum, aes(x=as.factor(Sample_ID), y = bdgt_mean, col = Survey))+geom
   labs(x = "Sample ID", y = "BdgT, log and scaled")+theme_minimal(base_size = 30)
 ```
 
-```{r plot-sd, fig.dim = c(10, 20)}
+```{r plot-sd, fig.dim = c(20, 10)}
 ggplot(rrcompsum, aes(x = rr_mean, y = latitud, col = Survey))+
   geom_point()+geom_errorbar(aes(xmin = rr_mean - rr_sd, xmax = rr_mean + rr_sd))+
   labs(y = "Latitude", y = "RR, log and scaled")+theme_minimal(base_size = 30)
@@ -166,18 +170,26 @@ rrcompr$logrrsc <- rrcompr$rr_mean %>% log %>% scale
 rrcompr$logbdgtsc <- rrcompr$bdgt_mean %>% log %>% scale
 
 saveRDS(rrcompr, "rrcompr.rds")
+```
+
+```{r plots-low-var}
+rrcompr <- readRDS ("rr_comp.rds")
+
+rrcompru <- rrcompr[!duplicated(rrcompr$Sample_ID),]
 
 summary(lm1  <- lm(logrrsc ~ logtocsc + region2, data=rrcompr))
-summary(lme1  <- lmer(logrrsc ~ logtocsc + (1 | region2) + (1 | Who), data=rrcompr))
+summary(lme1  <- lmer(logrrsc ~ logtocsc + (logtocsc | region2) + (logtocsc | Who), data=rrcompr))
+summary(lme1b  <- lmer(logrrsc ~ logtocsc + (1 | region2) + (1 | Who), data=rrcompr))
 
-aov(logrrsc~region2, data = rrcompr)
 
-ggplot(rrcompr,aes(x = region2, y=logrrsc))+geom_boxplot(outlier.shape = NA, notch = T)+
-  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.rr.sc", col = "Region")+
+aov(logrrsc~region2, data = group_by(rrcompr, Sample_ID))
+
+ggplot(group_by(rrcompr, Sample_ID),aes(x = region2, y=logrrsc))+geom_boxplot(outlier.shape = NA, notch = T)+
+  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.rr.sc", col = "Region", title = "log.rr.sc for samples with sd < 5")+
   theme_minimal(base_size = 25)
 
 ggplot(rrcompr,aes(x = region2, y=logbdgtsc))+geom_boxplot(outlier.shape = NA, notch = T)+
-  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.bdgt.sc", col = "Region")+
+  geom_jitter(aes(col=region2))+ labs(x = "", y = "log.bdgt.sc", col = "Region", title = "log.bdgt.sc for samples with rr.sd < 5")+
   theme_minimal(base_size = 25)
 
 ggplot(rrcompr)+geom_point(aes(x=rr_mean, y = rr_median))
