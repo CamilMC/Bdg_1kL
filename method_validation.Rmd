@@ -11,9 +11,11 @@ knitr::opts_chunk$set(echo = F, cache = F, collapse = T,  message = F, warning =
 
 ```{r libraries}
 library(ggplot2)
+library(cowplot)
 library(dplyr)
 library(readxl)
 library(lme4)
+
 
 memory.limit(size = 1e+10)
 
@@ -21,7 +23,21 @@ id.names <- c("station_id","station_code","nve_vatn_nr","nve_vassdrag_nr", "CBA_
 is_constant <- function(x) length(unique(x)) == 1L 
 ```
 
+
+# Intro
+
+Questions: 
+
+* Is the incubation method reliable?
+
+* What experimental factors influence most the results?
+
+
 # Full dataset
+
+Create a dataset merging respiration rates for the 1000 and the 100 lakes, together with water chemistry and catchments predictors.
+
+## Merge respiration rates from 1000 and 100 lakes
 
 ```{r merged.rr, eval = F}
 allsamples <- read.csv("All_samples.csv")
@@ -38,16 +54,10 @@ merged.rr$exp.date <- as.Date(newdate)
 write.csv(merged.rr, "merged.rr.csv")
 ```
 
-```{r plot-diff-dmax}
+```{r merge-niva-data, eval = F}
 
 merged.rr <- read.csv("merged.rr.csv")
-ggplot(merged.rr)+geom_point(aes(x = hwidth, y = dmax, shape = Who, col = Comments))+facet_grid(rows = vars(Who))+theme_minimal()
 
-ggplot(merged.rr)+geom_point(aes(x = hwidth, y = dmax, col = exp.date))+facet_grid(cols=vars(Who))+theme_minimal()
-
-```
-
-```{r merge-niva-data, eval = F}
 bdg.niva <- readRDS("bdg.niva.rds") %>% 
   dplyr::select(c("STATION_ID","CBA_Lake_ID","LAKE_NAME","SAMPLED_DATE","longitd","latitud","lake_area_km2","basin_area_km2","mar_limit","mean_elev","developed","agriculture","forest","natural_not_forest","peat","glacier","freshwater","sea","era_prec_2019","nilu_ndep_2012_2016","nilu_sdep_2012_2016","Dyp","rr_2m_19","tg_2m_19","doc_c_2019","kond_2019","toc_2019","ph_2019","tn_2019","tp_2019","region2","geometry")) 
 
@@ -66,79 +76,135 @@ names(rrcba) <- rename
 
 rr_comp <- rbind(filter(rrniva, Survey == "1000_lakes"),rrcba)
 rr_comp$SAMPLED_DATE <- as.Date(rr_comp$SAMPLED_DATE)
+rr_comp$exp.date <- as.Date(rr_comp$exp.date)
 
 rr_comp$diff.date <- rr_comp$exp.date - rr_comp$SAMPLED_DATE
 rr_comp$diff.week <- difftime(rr_comp$exp.date, rr_comp$SAMPLED_DATE, units = "weeks") %>% round(digits = 0)
 
+rr_comp$com <- NA
+index_nocom <- which(rr_comp$Comments == "")
+rr_comp$com[index_nocom] <- "nocom"
+rr_comp$com[which(is.na(rr_comp$com))] <- "com"
+
 saveRDS(rr_comp,"rr_comp.rds")
 ```
 
-```{r plot-diff}
-
+```{r 1000L-vs-100L}
 rr_comp <- readRDS("rr_comp.rds")
-
-ggplot(rr_comp)+geom_point(aes(x=diff.date, y = dmax, col = Who, shape = region2))+facet_grid(cols=vars(Survey))
-
-ggplot(rr_comp)+geom_point(aes(x=SAMPLED_DATE,y=exp.date, col = dmax))
-
-ggplot(rr_comp)+geom_boxplot(aes(x=Survey, y = diff.date))+geom_jitter(aes(x=Survey, y = diff.date, col = latitud))+theme_minimal()
-
-
 common_id <- filter(rr_comp, Survey == "100_lakes") %>% pull("Sample_ID")
   
-ggplot(filter(rr_comp, Sample_ID %in% common_id))+geom_point(aes(x=as.factor(Sample_ID), y = dmax, col = Survey))
+q1 <- qplot(x = filter(rr_comp, Sample_ID %in% common_id & Survey == "100_lakes")$dmax, y = filter(rr_comp, Sample_ID %in% common_id & Survey == "1000_lakes")$dmax, colour = as.factor(filter(rr_comp, Sample_ID %in% common_id& Survey == "1000_lakes")$diff.date))+
+  labs(x="RR 100 lakes", y = "RR 1000 lakes", col = "Days between sampling and incubation")+
+  scale_color_viridis_d()+
+  theme_minimal()
 
-qplot(x = filter(rr_comp, Sample_ID %in% common_id & Survey == "100_lakes")$dmax, y = filter(rr_comp, Sample_ID %in% common_id & Survey == "1000_lakes")$dmax, colour = as.factor(filter(rr_comp, Sample_ID %in% common_id& Survey == "1000_lakes")$diff.week))+labs(x="RR 100 lakes", y = "RR 1000 lakes", col = "Diff time weeks")+theme_minimal()
+q2 <- qplot(x = filter(rr_comp, Sample_ID %in% common_id & Survey == "100_lakes")$hwidth, y = filter(rr_comp, Sample_ID %in% common_id & Survey == "1000_lakes")$hwidth, colour = as.factor(filter(rr_comp, Sample_ID %in% common_id& Survey == "1000_lakes")$diff.date))+
+  labs(x="BdgT 100 lakes", y = "BdgT 1000 lakes", col = "Days between sampling and incubation")+
+  scale_color_viridis_d()+
+  theme_minimal()
 
+library(ggpubr)
+
+ggarrange(q1,q2,common.legend = T, ncol = 2)
 ```
 
+```{r fit-dmax}
+ggplot(rr_comp)+geom_point(aes(x=fit_r2, y = dmax))+xlim(0.99,1)
 
-```{r sort-df, fig.dim = c(20,10)}
+boxplot(rr_comp$fit_r2)
+
+
+````
+
+## Scale variables
+
+```{r sort-df, eval = F}
+
 rr_comp <- readRDS("rr_comp.rds")
-rrcompsc <- subset(rr_comp, log(dmax)> 0) %>% subset(log(hwidth)> 0)
-rrcompsc$logdmaxsc <- rrcompsc$dmax %>% log %>% scale
-rrcompsc$loghwidthsc <- rrcompsc$hwidth %>% log %>% scale
-rrcompsc$logtocsc <- rrcompsc$toc_2019 %>% log %>% scale
 
-
-ggplot(rrcompsc)+geom_line(aes(x=as.factor(Sample_ID), y = logdmaxsc, col = Survey))+labs(x = "Sample ID", y = "RR, log and scaled")+theme_minimal(base_size = 30)
-ggplot(rrcompsc)+geom_line(aes(x=as.factor(Sample_ID), y = loghwidthsc, col = Survey))+labs(x = "Sample ID", y = "BdgT, log and scaled")+theme_minimal(base_size = 30)
+rrcompsc <- subset(rr_comp, fit_r2 > 0.6) %>% subset(hwidth > 0)
+#rrcompsc <- subset(rr_comp, log(dmax)> 0) %>% subset(log(hwidth)> 0)
+rrcompsc$logdmaxsc <- rrcompsc$dmax %>% log() %>% scale() %>% as.numeric()
+rrcompsc$loghwidthsc <- rrcompsc$hwidth %>% log() %>% scale() %>% as.numeric()
+rrcompsc$logtocsc <- rrcompsc$toc_2019 %>% log() %>% scale() %>% as.numeric()
 
 saveRDS(rrcompsc, "rrcompsc.rds")
 ```
 
-```{r plot-rr, fig.dim = c(20,10)}
-ggplot(rrcompsc)+geom_line(aes(y=latitud, x = logdmaxsc, col = Survey, group = Sample_ID))+
-  labs(y = "Latitude", x = "RR, log and scaled")+theme_minimal(base_size = 30)+
+```{r plot-rr, fig.dim = c(20,20)}
+rrcompsc <- readRDS("rrcompsc.rds")
+
+g1 <- ggplot(rrcompsc)+geom_line(aes(y=latitud, x = logdmaxsc, col = as.factor(diff.date), group = Sample_ID))+
+  labs(y = "Latitude", x = "RR, log and scaled", col = "Days between sampling and incubation")+
+  scale_color_viridis_d()+
+  facet_grid(cols = vars(Survey))+
+  theme(legend.position = "none")+
   theme_minimal(base_size = 30)
 
-ggplot(rrcompsc)+geom_line(aes(y=latitud, x = loghwidthsc, col = Survey, group = Sample_ID))+
-  labs(y = "Latitude", x = "BsgT, log and scaled")+theme_minimal(base_size = 30)+
+g2 <- ggplot(rrcompsc)+geom_line(aes(y=latitud, x = loghwidthsc, col = as.factor(diff.date), group = Sample_ID))+
+  labs(y = "Latitude", x = "BdgT, log and scaled", col = "Days between sampling and incubation")+
+  scale_color_viridis_d()+
+  facet_grid(cols = vars(Survey))+
+  theme(legend.position = "none")+
   theme_minimal(base_size = 30)
+
+ggarrange(g1,g2,common.legend = T, nrow = 2)
 
 ```
 
-```{r mixed-model-date}
-summary(lme0  <- lmer(logdmaxsc ~ 1 + (1 | region2/Sample_ID) + (1 | diff.week), data=rrcompsc))
+
+## Plot
+
+```{r plot-diff, fig.dim = c(10,5)}
+rrcompsc <- readRDS("rrcompsc.rds")
+
+ggplot(rrcompsc)+geom_point(aes(x=loghwidthsc, y = logdmaxsc, col = Survey))+
+  facet_grid(cols=vars(region2))+
+    theme_minimal()+
+  theme(legend.position = "bottom")
+
+
 ```
+
+
+
+
+
+
+
+
+```{r mixed-model-date, fig.dim = c(20,10)}
+s0 <- summary(lme0  <- lmer(logdmaxsc ~ 1 + (1 | region2/Sample_ID) + (1 | diff.week) + (1 | com), data=rrcompsc))
+data.frame(variance = s0$varcor) %>% knitr::kable()
+
+library(sjPlot)
+library(glmmTMB)
+plot_model(lme0, type = "re")[[1]]
+
+```
+
+
+## Study standard deviation of measurements
 
 ```{r sd-sample}
+rrcompsc <- readRDS("rrcompsc.rds")
 rrsum <- rrcompsc %>% group_by(Sample_ID,Survey) %>% summarize(rr_mean = mean(dmax), rr_sd = sd(dmax), rr_median = median(dmax), bdgt_mean = mean(hwidth), bdgt_sd = sd(hwidth), bdgt_median = median(hwidth))
 saveRDS(rrsum, "rrsum.rds")
 
-hist(rrsum$rr_sd)
-hist(rrsum$bdgt_sd)
+remove_columns <- c(names(merged.rr)[-which(names(merged.rr) %in% c("Sample_ID","Survey", "Who","Sampling_date","exp.date"))], "logdmaxsc", "loghwidthsc")
 
-boxplot(rrsum$rr_sd)
-boxplot(rrsum$bdgt_sd)
+d <- distinct(select(rrcompsc, !all_of(remove_columns)))
+rrcompsum <- merge(rrsum, d, by = c("Sample_ID", "Survey"), all.y = F)
 
-rrcompsum <- merge(rrcompsc, rrsum, by = c("Sample_ID", "Survey"))
+rrcompsum$logrrsdsc <- rrcompsum$rr_sd %>% log %>% scale %>% as.numeric
+rrcompsum$logbdgtsdsc <- rrcompsum$bdgt_sd %>% log %>% scale %>% as.numeric
 
+summary(lme2  <- lmer(logrrsdsc ~ 1 + (1 | region2) + (1 | Who), data=rrcompsum))
+summary(lme2b  <- lmer(logbdgtsdsc ~ 1 + (1 | region2) + (1 | Who), data=rrcompsum))
+summary(lme2c  <- lmer(rr_sd ~ 1 + (1 | region2) + (1 | Who) + (1 | com) + (1 | diff.week), data=rrcompsum))
+plot_model(lme2c, type = "re")
 
-hist(rrcompsum$rr_sd)
-hist(log(rrcompsum$rr_sd))
-rrcompsum$logrrsdsc <- rrcompsum$rr_sd %>% log %>% scale
-summary(lme2  <- lmer(logrrsdsc ~ 1 + (1 | region2) + (1 | Who) + (1 | Sample_ID), data=rrcompsum))
+ggplot(rrcompsum)+geom_point(aes(y = rr_sd, x = rr_mean))
 
 saveRDS(rrcompsum, "rrcompsum.rds")
 ```
@@ -163,6 +229,8 @@ ggplot(rrcompsum, aes(x = bdgt_mean, y = latitud, col = Survey))+
   labs(y = "Latitude", y = "BdgT, log and scaled")+theme_minimal(base_size = 30)
 ```
 
+
+
 ```{r remove-high-variability}
 rrcompr <- filter(rrcompsum, rr_sd < 5)
 
@@ -173,7 +241,7 @@ saveRDS(rrcompr, "rrcompr.rds")
 ```
 
 ```{r plots-low-var}
-rrcompr <- readRDS ("rr_comp.rds")
+rrcompr <- readRDS ("rrcompr.rds")
 
 rrcompru <- rrcompr[!duplicated(rrcompr$Sample_ID),]
 
